@@ -1,0 +1,173 @@
+# PROBAR EL PAQUETE DE MAC EN MAC DE VERDAD, SIN TENER UN MAC (1-10-2026)
+#
+# Esto lo ejecuta GitHub en sus propios Mac (uno con chip Apple y uno de Intel).
+# No lleva nuestro codigo ni ninguna clave: solo se baja el MISMO zip que se baja
+# un cliente y lo mira por dentro, como lo miraria un Mac.
+#
+# Que comprueba (todo en un Mac real):
+#   1. que el zip se descomprime como lo hace el Finder
+#   2. que clase de programa es cada fichero (Intel, chip Apple, universal)
+#   3. si la firma es valida y si el .app esta sellado   (codesign)
+#   4. lo que diria Gatekeeper del .app recien bajado de internet   (spctl)
+#   5. si el programa ARRANCA y se queda vivo, y si no, con que codigo muere
+#   6. una foto de la pantalla con el programa abierto
+#   7. que adb es el de Mac y funciona
+#
+# Que NO puede comprobar: el cable USB ni el GPS (los Mac de GitHub no tienen
+# ninguno), ni pulsar a mano "Abrir igualmente" en Ajustes.
+#
+# COMO SE USA: pestaña Actions -> "Probar el paquete de Mac" -> Run workflow.
+# Tarda unos 4 minutos. El resultado sale en pantalla, en "Summary", y las fotos
+# y los textos quedan para bajar al final de la pagina.
+
+name: Probar el paquete de Mac
+
+on:
+  workflow_dispatch:
+    inputs:
+      url:
+        description: "Direccion del zip de Mac que se quiere probar"
+        required: true
+        default: "https://pub-7a37c8ab247e4dbca73e6027333b32dc.r2.dev/descargas/x24/NaviPro-Actualizador-Android-Mac.zip"
+
+jobs:
+  probar:
+    name: ${{ matrix.nombre }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: macos-15
+            nombre: "Mac con chip Apple (M1)"
+          - os: macos-15-intel
+            nombre: "Mac de Intel"
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 20
+    env:
+      URL: ${{ inputs.url }}
+      APP: "NaviPro Actualizador.app"
+    steps:
+      - name: 1. Que Mac es este
+        run: |
+          mkdir -p informe
+          {
+            echo "## ${{ matrix.nombre }}"
+            echo ""
+            echo '```'
+            sw_vers
+            echo "chip: $(uname -m)  ($(sysctl -n machdep.cpu.brand_string 2>/dev/null))"
+            echo '```'
+          } | tee -a informe/resumen.md >> "$GITHUB_STEP_SUMMARY"
+
+      - name: 2. Bajarlo como un cliente y descomprimirlo como el Finder
+        run: |
+          curl -sSL -A "Mozilla/5.0" -o mac.zip "$URL"
+          {
+            echo "### 2. El zip"
+            echo '```'
+            ls -la mac.zip
+            shasum -a 256 mac.zip
+            echo '```'
+          } | tee -a informe/resumen.md >> "$GITHUB_STEP_SUMMARY"
+          # ditto es lo que hace por dentro la utilidad de archivos de macOS
+          ditto -x -k mac.zip bajado
+          ls -laR bajado | head -40
+
+      - name: 3. Que es cada fichero
+        run: |
+          {
+            echo "### 3. Que clase de programa es cada fichero"
+            echo '```'
+            find "bajado/$APP/Contents" -type f | while read -r f; do
+              echo "$(basename "$f")"
+              echo "    $(file -b "$f")"
+              case "$(file -b "$f")" in *universal*) lipo -info "$f" 2>&1 | sed 's/^/    /';; esac
+            done
+            echo '```'
+          } | tee -a informe/resumen.md >> "$GITHUB_STEP_SUMMARY"
+
+      - name: 4. La firma y si el .app esta sellado
+        run: |
+          {
+            echo "### 4. Firma"
+            echo '```'
+            echo "--- codesign -dvvv"
+            codesign -dvvv "bajado/$APP" 2>&1 | grep -E "Identifier|Format|CodeDirectory|Signature|Info.plist|Sealed|flags|Authority|TeamIdentifier" || true
+            echo ""
+            echo "--- codesign --verify --deep --strict"
+            codesign --verify --deep --strict --verbose=4 "bajado/$APP" 2>&1 || echo "(codesign dice que NO es valida: codigo $?)"
+            echo '```'
+          } | tee -a informe/resumen.md >> "$GITHUB_STEP_SUMMARY"
+
+      - name: 5. Lo que diria Gatekeeper de un .app recien bajado de internet
+        run: |
+          cp -R "bajado" bajado-con-marca
+          # la marca que le pone el navegador a todo lo que baja
+          xattr -r -w com.apple.quarantine "0083;$(printf '%x' "$(date +%s)");Safari;" "bajado-con-marca/$APP"
+          {
+            echo "### 5. Gatekeeper (con la marca de 'bajado de internet')"
+            echo '```'
+            xattr -l "bajado-con-marca/$APP" | head -3
+            spctl --assess --type execute --verbose=4 "bajado-con-marca/$APP" 2>&1 || echo "(Gatekeeper lo rechaza: codigo $?)"
+            echo '```'
+            echo "_Ojo: un .app firmado a medias o roto sale aqui como 'a sealed resource is missing or invalid' o 'invalid signature'. Es el equivalente al mensaje de 'esta danado'._"
+          } | tee -a informe/resumen.md >> "$GITHUB_STEP_SUMMARY"
+
+      - name: 6. Rosetta (solo en el Mac de chip Apple)
+        if: matrix.os == 'macos-15'
+        run: |
+          if arch -x86_64 /usr/bin/true 2>/dev/null; then
+            echo "Rosetta ya estaba instalada"
+          else
+            sudo softwareupdate --install-rosetta --agree-to-license || true
+          fi
+          arch -x86_64 /usr/bin/true && echo "Rosetta funciona" || echo "Rosetta NO funciona"
+
+      - name: 7. Arrancar el programa y ver si se queda vivo
+        run: |
+          cp -R bajado bajado-sin-marca
+          xattr -cr "bajado-sin-marca/$APP"          # sin marca: aqui se prueba el programa, no Gatekeeper
+          chmod +x "bajado-sin-marca/$APP/Contents/MacOS/"* 2>/dev/null || true
+          PROG="bajado-sin-marca/$APP/Contents/MacOS/NaviPro-Android"
+          "$PROG" > arranque.txt 2>&1 &
+          PID=$!
+          sleep 25
+          screencapture -x informe/pantalla.png 2>/dev/null || echo "no se pudo sacar foto" >> arranque.txt
+          if kill -0 "$PID" 2>/dev/null; then
+            VIVO="SI: sigue vivo a los 25 segundos (el programa arranca)"
+            kill "$PID" 2>/dev/null || true
+          else
+            wait "$PID" 2>/dev/null; CODIGO=$?
+            VIVO="NO: se murio solo, con codigo $CODIGO (137 = lo mato el sistema, normalmente por la firma)"
+          fi
+          {
+            echo "### 7. ¿Arranca?"
+            echo "**$VIVO**"
+            echo ""
+            echo "Lo que escribio el programa:"
+            echo '```'
+            head -c 3000 arranque.txt
+            echo '```'
+          } | tee -a informe/resumen.md >> "$GITHUB_STEP_SUMMARY"
+          cp arranque.txt informe/
+
+      - name: 8. adb, el programa que habla con el GPS
+        run: |
+          ADB="bajado-sin-marca/$APP/Contents/MacOS/adb"
+          {
+            echo "### 8. adb"
+            echo '```'
+            file -b "$ADB"
+            "$ADB" version 2>&1 | head -3
+            "$ADB" devices 2>&1 | head -3
+            echo '```'
+            echo "_(sin ningun GPS enchufado: aqui solo se comprueba que adb arranca)_"
+          } | tee -a informe/resumen.md >> "$GITHUB_STEP_SUMMARY"
+
+      - name: 9. Guardar el informe y la foto
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: informe-${{ matrix.os }}
+          path: informe/
+          retention-days: 14
